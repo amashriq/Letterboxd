@@ -1,0 +1,438 @@
+LETTERBOXD RECOMMENDATION SYSTEM — PROJECT ROADMAP
+====================================================
+7 Phases · 26 Steps
+Built with Python, FastAPI, scikit-learn, Surprise, React, and Claude Code
+
+
+NOTE ON USING CLAUDE CODE
+--------------------------
+This project is well-suited for Claude Code. Use it for boilerplate-heavy
+tasks: scaffolding the FastAPI project structure, writing the pandas cleaning
+pipeline, generating pytest fixtures, and building the React components.
+Reserve your own focus for the decisions Claude Code can't make for you —
+choosing between Ridge vs Lasso, designing the pseudo-user injection strategy,
+and deciding how to weight your hybrid model. Those choices require
+understanding your own data.
+
+
+════════════════════════════════════════════════════════════════
+PHASE 1 — DATA PIPELINE
+════════════════════════════════════════════════════════════════
+
+Step 1 — Parse Letterboxd export
+---------------------------------
+Letterboxd lets you export your data as a ZIP file containing several CSVs.
+The two that matter most for this project are ratings.csv (your explicit star
+ratings, which become your training labels) and diary.csv (every logged watch,
+including rewatches and unrated films). Load ratings.csv with pandas, extract
+the film slug from the Letterboxd URI column (e.g. "mulholland-drive" from
+"https://letterboxd.com/film/mulholland-drive/"), drop any rows with a missing
+rating, coerce the Rating column to float, and deduplicate by slug keeping the
+most recent rating in cases where you re-rated a film. Pull rewatch counts from
+diary.csv and merge them in as a feature — films you rewatched carry a strong
+implicit positive signal. Also build a "seen slugs" set from diary.csv, which
+becomes your filter for the /recommend endpoint later. Important note: with
+only ~70 films rated, you are working with a very small dataset. This is not a
+dealbreaker, but it shapes every model choice downstream.
+
+Step 2 — Enrich with TMDB API
+-------------------------------
+The Letterboxd export contains no usable features beyond title, year, and slug.
+All the actual signal — genres, director, cast, runtime, language — has to come
+from TMDB. The slug is your best lookup key: search TMDB by title and year,
+match on the slug, and cache every response aggressively because TMDB's free
+tier is rate-limited at 40 requests per second. For the personal version of the
+project (trained on your own ratings), you will make around 70 TMDB calls and
+it is fast. For the multi-user version where you pre-cache the entire MovieLens
+catalog, you will make around 62,000 calls in a one-time offline script — run
+it overnight with a 40ms sleep between requests and save the result as a
+parquet file. The fields you actually need are: genres (list), director
+(string), top 3 cast members (list), runtime (int), release year (int), vote
+average (float), and original language (string).
+
+Step 3 — Join and clean data
+------------------------------
+Merge your Letterboxd ratings DataFrame with the TMDB metadata you fetched,
+joining on TMDB ID. Handle the cases where TMDB returns no result (obscure or
+foreign films that aren't in their database) — log these as unmatched and
+decide whether to drop them or attempt a fuzzy title search. Check for and
+handle nulls in every feature column: some films on TMDB have missing runtime,
+missing director, or incomplete cast. Impute numeric nulls with column medians
+and categorical nulls with an explicit "Unknown" token rather than dropping
+rows, since you can't afford to lose data at this scale. Validate that your
+final joined DataFrame has the expected shape and that no column is more than
+20% null before proceeding. Claude Code is useful here for generating the
+validation checks and null-handling boilerplate.
+
+Step 4 — Exploratory analysis
+-------------------------------
+Before building any model, understand your own rating behavior. Plot your
+rating distribution — most people cluster heavily around 3–4 stars, and a
+model that simply predicts your mean for every film will have a deceptively low
+RMSE. This "predict the mean" baseline is the number you need to beat and you
+should compute it explicitly before training anything. Also examine: which
+genres you rate most frequently vs. most highly (these are often different),
+your rating behavior by decade (most people underrate films from decades before
+they were born), and whether rewatched films rate systematically higher (they
+almost always do, by about half a star). These patterns directly inform your
+feature engineering choices in the next phase.
+
+
+════════════════════════════════════════════════════════════════
+PHASE 2 — CONTENT-BASED FILTERING
+════════════════════════════════════════════════════════════════
+
+Step 5 — Feature engineering
+------------------------------
+Transform your cleaned TMDB metadata into a numeric feature matrix that a
+regression model can consume. Genres should be multi-hot encoded — each genre
+gets its own binary column, and a film can belong to multiple. Director and
+cast require a different approach since there are thousands of unique values:
+use frequency encoding (replace each name with how many times they appear in
+your ratings) or target encoding (replace each name with the average rating of
+films they appear in). Release year should be kept as a raw integer or bucketed
+into decades. Runtime and vote average can be used as-is after normalization.
+Original language should be binary-encoded as English vs. non-English unless
+you have enough non-English films to split further. The most important feature
+engineering decision is director encoding — director is the single strongest
+predictor of your taste, but only for directors you have seen multiple times.
+A director you have only seen once has no meaningful encoding. Claude Code can
+help scaffold the sklearn Pipeline and ColumnTransformer that wraps all of
+this into one reusable object.
+
+Step 6 — Train regression model
+---------------------------------
+With 70 training examples, Ridge regression is the correct choice over
+RandomForest or XGBoost. Tree-based methods have too many degrees of freedom
+for this data size and will memorize the training set. Ridge has a single
+regularization hyperparameter (alpha) that penalizes large coefficients,
+forcing the model to generalize. Also consider Lasso, which additionally
+zeroes out irrelevant features — useful if you suspect many of your encoded
+columns carry no real signal. Use RidgeCV, which tests a range of alpha values
+in one call, so you get automatic hyperparameter tuning with no extra code.
+Wrap your feature preprocessing and the Ridge model together into a single
+sklearn Pipeline object — this is critical for correct serialization and
+inference later.
+
+Step 7 — Cross-validate
+-------------------------
+With 70 samples, standard 5-fold cross-validation leaves you training on 56
+examples per fold, which is acceptable. Leave-One-Out cross-validation (LOOCV)
+is even more honest — it trains on 69 examples per fold and tests on 1,
+rotating through all 70 — and sklearn supports it natively. Compute RMSE on
+each fold and report mean and standard deviation. The mean tells you expected
+generalization error; the standard deviation tells you how stable the model is.
+Compare your model's RMSE against the dumb baseline (predict the mean) and the
+slightly less dumb baseline (predict the median). If your model does not
+clearly beat both baselines, your features are not informative enough and you
+should go back to Step 5 before continuing.
+
+Step 8 — Serialize with joblib
+--------------------------------
+Save the entire sklearn Pipeline — preprocessing steps and Ridge model together
+— as a single joblib file. The key mistake to avoid is saving the model and
+the feature transformer separately, because you must apply the exact same
+transformations at inference time that you applied at training time, and
+keeping them together in one Pipeline guarantees this. Name the file with a
+clear convention like content_model_{user_id}.joblib for the multi-user
+version. Test that you can load the file in a fresh Python process and call
+.predict() on a raw input dictionary without any additional setup — if you
+can't, your serialization boundary is in the wrong place.
+
+
+════════════════════════════════════════════════════════════════
+PHASE 3 — COLLABORATIVE FILTERING
+════════════════════════════════════════════════════════════════
+
+Step 9 — Load MovieLens 25M
+-----------------------------
+Download the MovieLens 25M dataset from grouplens.org. The file you care about
+is ratings.dat or ratings.csv, which contains 25 million rows of
+(userId, movieId, rating, timestamp) tuples from 162,000 users across 62,000
+films. Load it into pandas and understand the schema. The movieId in MovieLens
+maps to TMDB IDs via the links.csv file in the same download — this is how you
+will eventually connect a film from your Letterboxd ratings to its position in
+the MovieLens matrix. Build a mapping dictionary from TMDB ID to MovieLens
+movieId early, because you will use it repeatedly. The full ratings matrix is
+too large to store dense — think of it as a sparse matrix where most entries
+are missing.
+
+Step 10 — Design user mapping (pseudo-user injection)
+-------------------------------------------------------
+This is the most architecturally important decision in the collaborative
+filtering phase. The problem: you are not a user in the MovieLens dataset, so
+the trained SVD model has no embedding for you. With only 70 ratings, SVD is
+also a weak choice because your user embedding will be dominated by the bias
+terms of popular films. The better approach for this scale is item-item
+similarity: instead of learning a user embedding, you compute a similarity
+score between each candidate film and the films in your ratings, weighted by
+your ratings. For each unrated film, find the K most similar films using the
+MovieLens item-item similarity matrix (which is learned from all 162,000 users
+and is therefore reliable), then compute a weighted average of your ratings for
+those neighbors. This approach requires no user embedding, handles the cold
+start problem correctly, and produces more interpretable results. Use
+KNNBaseline from the Surprise library with user_based=False.
+
+Step 11 — Train SVD or KNN model
+----------------------------------
+Use the Surprise library. If you went with item-item similarity (recommended),
+train a KNNBaseline model with Pearson Baseline similarity, user_based=False,
+and a minimum support of 5 co-raters. Train it on the full MovieLens 25M data.
+This will take several minutes. If you chose SVD instead, train with
+n_factors=100 and regularization around 0.02, and plan for the fold-in
+inference strategy (computing your user embedding from your ratings after the
+fact without retraining). Either way, cross-validate on MovieLens itself to
+confirm the model is well-calibrated before you use it for your personal
+predictions. Claude Code can help with the Surprise API boilerplate and the
+cross-validation loop.
+
+Step 12 — Serialize CF model
+------------------------------
+Save the trained Surprise model with joblib. For the item-item approach, what
+you are saving is the full similarity matrix and the baseline estimates —
+together these allow you to compute a CF score for any film given a set of
+user ratings without retraining. Test inference by taking 5 of your rated films
+out of your training set, asking the model to predict them using the remaining
+65 as the user's history, and checking whether the predictions are reasonable.
+This is an important sanity check before you build the hybrid layer on top.
+
+
+════════════════════════════════════════════════════════════════
+PHASE 4 — HYBRID MODEL
+════════════════════════════════════════════════════════════════
+
+Step 13 — Generate stacking data
+----------------------------------
+For every film in your ratings, generate two predictions: one from the
+content-based model (using TMDB features) and one from the CF model (using
+item-item similarity with the rest of your ratings as the user's history). Use
+leave-one-out to avoid data leakage — when generating the CF prediction for
+film X, train the CF inference using your other 69 ratings, not all 70. This
+gives you a DataFrame with columns [cb_score, cf_score, actual_rating] with 70
+rows, which becomes the training set for your blender.
+
+Step 14 — Train blending model
+--------------------------------
+With 70 training examples and 2 input features, XGBoost is the wrong tool —
+it will overfit trivially. The right choice is a simple linear regression with
+two coefficients: one weight for the CB score and one for the CF score. This
+is not a limitation, it is the correct statistical decision. You can report the
+learned weights in your README and they will be meaningful: if CB gets a weight
+of 0.7 and CF gets 0.3, that tells a clear story about how much you can learn
+from 70 ratings versus the collaborative signal. Also try the even simpler
+approach of fixed equal weights (0.5 / 0.5) and see if the learned weights
+actually improve LOOCV RMSE — they may not, which is itself an interesting
+finding to document.
+
+Step 15 — Serialize hybrid pipeline
+-------------------------------------
+Package the entire inference chain — feature encoding, CB prediction, CF lookup,
+linear blend — into a single callable class that accepts a TMDB ID (or film
+metadata dict) and returns a predicted rating. This class holds references to
+the loaded joblib files internally. Serialize this wrapper with joblib as the
+single artifact the FastAPI application loads at startup. The API layer should
+never need to know whether a prediction came from content-based or collaborative
+filtering — it just calls model.predict(film_id) and gets a float back.
+
+
+════════════════════════════════════════════════════════════════
+PHASE 5 — FASTAPI BACKEND
+════════════════════════════════════════════════════════════════
+
+Step 16 — Project structure
+-----------------------------
+Scaffold your FastAPI project with a clear directory layout before writing any
+endpoint code. A workable structure: a top-level app/ directory containing
+main.py (the app factory and startup lifespan), a routers/ subdirectory with
+one file per endpoint group (predict.py, recommend.py, filter.py, upload.py),
+a models/ subdirectory for Pydantic request and response schemas, and a
+ml/ subdirectory for your inference wrapper. Load all ML models once at startup
+using FastAPI's lifespan context manager and attach them to app.state — this
+avoids reloading multi-MB joblib files on every request. Claude Code is
+excellent at scaffolding this structure from a description; give it the layout
+above and have it generate the skeleton files before you fill in the logic.
+
+Step 17 — POST /predict
+-------------------------
+This is the simplest endpoint and a good one to build first. Define a Pydantic
+request model that accepts a TMDB film ID (or slug) and any optional metadata
+fields. Inside the handler, load the user's model from app.state using the
+session_id from the request header, call the inference pipeline, and return the
+predicted rating along with a confidence indicator (the standard deviation of
+your LOOCV scores is a reasonable proxy). The Pydantic model does input
+validation for free — if the client sends a malformed request, FastAPI returns
+a 422 with a descriptive error message automatically. Test this endpoint
+thoroughly with httpx or curl before moving to the more complex endpoints.
+
+Step 18 — GET /recommend
+--------------------------
+This endpoint scores all films in your pre-cached TMDB catalog that the user
+has not yet seen, sorts them, and returns the top N. The naive implementation —
+call predict() in a loop for every film — is too slow if your catalog has
+62,000 films. The content-based part of inference can be vectorized: run the
+entire catalog through your feature matrix in one sklearn predict() call, which
+handles batch scoring internally. The CF part requires per-film lookups but
+those are dictionary reads, not model calls. Implement a pre-scoring approach:
+at upload time (when the user's model is first trained), score the entire
+catalog once and cache the results to disk as a sorted list. The /recommend
+endpoint then just reads and filters this pre-scored list, making response time
+sub-millisecond regardless of catalog size.
+
+Step 19 — GET /filter
+-----------------------
+This endpoint accepts query parameters — minimum score, genre, year range,
+language — and returns films from the user's pre-scored list that meet those
+criteria. FastAPI handles query parameter parsing natively with type annotations.
+The implementation is mostly a filtering operation on the pre-scored DataFrame.
+Design the query parameters with defaults that return a reasonable result with
+no input, so the frontend can call this endpoint on first load without requiring
+user configuration. Claude Code can generate the filter logic and the Pydantic
+query parameter models quickly.
+
+Step 20 — CORS and error handling
+-----------------------------------
+Add CORS middleware to allow your React frontend to call the API during local
+development — without it, browsers will block cross-origin requests. Add a
+global exception handler that catches unexpected errors and returns a structured
+JSON response with a descriptive message rather than a raw Python traceback.
+Add request validation for the session_id header — return a 401 with a clear
+message if it is missing or if no model file exists for that ID. Start the
+server with uvicorn and navigate to /docs to verify that FastAPI's automatic
+documentation lists all your endpoints with correct schemas. A recruiter
+who can hit your /docs URL immediately understands the API without reading
+any code, which is valuable for a portfolio project.
+
+
+════════════════════════════════════════════════════════════════
+PHASE 6 — REACT FRONTEND
+════════════════════════════════════════════════════════════════
+
+Step 21 — Upload and onboarding view
+--------------------------------------
+The first screen a user sees should be a CSV upload interface. Accept a drag-
+and-drop or file picker input, POST the file to your /upload endpoint, and show
+a loading state while the model trains. Because training takes under 2 seconds,
+you do not need a progress bar — a simple spinner with a message like
+"Analyzing your taste in 147 films..." is enough. On success, store the
+returned session_id in localStorage and redirect to the recommendation feed.
+On error (fewer than 10 ratings, malformed CSV), show a helpful message. This
+onboarding flow is the most memorable part of the demo — the moment it works
+end-to-end is when the project feels real. Claude Code can build this component
+quickly; focus your own attention on the copy and the error states.
+
+Step 22 — Recommendation feed
+-------------------------------
+Call GET /recommend on load and render a grid of movie cards. Each card should
+show the poster image (fetch from TMDB using the film's poster_path), title,
+year, your predicted rating displayed as stars, and the genres. Implement
+infinite scroll or pagination — loading 20 cards at a time with a "load more"
+button is simpler than infinite scroll and works fine for a portfolio demo. Add
+a sort control (by predicted rating, by recency, by popularity) that re-calls
+the endpoint with different parameters. The recommendation feed is the core
+value proposition of the app — spend time making the cards look good. A visually
+polished recommendation feed that shows accurate-feeling results is what
+interviewers remember.
+
+Step 23 — Filter and browse view
+----------------------------------
+A secondary view that lets users explore the full catalog filtered by genre,
+decade, minimum predicted rating, and language. Connect the filter controls to
+GET /filter query parameters and debounce the API calls so you are not firing
+a request on every slider tick. Show the result count as filters change. A
+useful addition: a "surprise me" button that calls /recommend with a randomized
+offset, which showcases the recommendation depth of the system beyond the top
+10. Claude Code can generate the filter component and the debounced API hook;
+focus on making the interaction feel responsive.
+
+
+════════════════════════════════════════════════════════════════
+PHASE 7 — DOCUMENTATION AND POLISH
+════════════════════════════════════════════════════════════════
+
+Step 24 — Write README
+------------------------
+Your README is the first thing a recruiter reads and it does most of the
+portfolio work. It should contain: a one-paragraph description of what the
+project does and who it is for, a system architecture diagram (you already have
+this), a section on ML design decisions explaining why you chose Ridge over
+RandomForest and item-item CF over SVD given your data scale (this demonstrates
+ML judgment, not just implementation), setup instructions that actually work,
+and a link to the live demo. The design decisions section is the most important
+part — it transforms the project from "student built a recommender" to "student
+made principled architectural choices under constraints." The cold-start problem
+and your specific solutions to it are genuinely interesting and worth describing
+in detail. Claude Code can help format and structure the README but the design
+decisions section should be written in your own words.
+
+Step 25 — Add unit tests
+--------------------------
+Write pytest tests for the two highest-risk parts of the system: the feature
+engineering pipeline and the API endpoints. For the pipeline, test that the
+same input always produces the same output (determinism), that null handling
+does not crash, and that the output shape matches what the model expects. For
+the API, use FastAPI's TestClient to test each endpoint with valid inputs,
+missing session IDs, and malformed inputs — verify the correct status codes
+and response shapes. You do not need 100% coverage for a portfolio project, but
+having tests for the core pipeline shows engineering discipline that many
+student projects lack. Claude Code is well-suited for generating pytest
+fixtures and test cases once you describe the expected behavior.
+
+Step 26 — Dockerize and deploy
+--------------------------------
+Write a Dockerfile for your FastAPI backend that installs Python dependencies,
+copies your pre-built TMDB cache and serialized ML models, and starts uvicorn.
+Keep the image small by using a slim Python base image and separating the
+dependency installation layer from the code layer so Docker can cache it.
+Deploy to Railway or Render — both offer free tiers sufficient for a demo and
+support Docker deployments with minimal configuration. For the React frontend,
+deploy to Vercel or Netlify, update the API base URL to point at your deployed
+backend, and verify CORS is configured for the production domain. Once both are
+live, add the frontend URL prominently to your GitHub README and LinkedIn
+project entry. A recruiter who can open your app and upload their own
+Letterboxd CSV will remember your project far longer than one who only reads
+about it.
+
+
+════════════════════════════════════════════════════════════════
+QUICK REFERENCE — ALL 26 STEPS
+════════════════════════════════════════════════════════════════
+
+Phase 1 — Data pipeline
+  1.  Parse Letterboxd export
+  2.  Enrich with TMDB API
+  3.  Join and clean data
+  4.  Exploratory analysis
+
+Phase 2 — Content-based filtering
+  5.  Feature engineering
+  6.  Train regression model
+  7.  Cross-validate
+  8.  Serialize with joblib
+
+Phase 3 — Collaborative filtering
+  9.  Load MovieLens 25M
+  10. Design user mapping (pseudo-user injection)
+  11. Train SVD or KNN model
+  12. Serialize CF model
+
+Phase 4 — Hybrid model
+  13. Generate stacking data
+  14. Train blending model
+  15. Serialize hybrid pipeline
+
+Phase 5 — FastAPI backend
+  16. Project structure
+  17. POST /predict
+  18. GET /recommend
+  19. GET /filter
+  20. CORS and error handling
+
+Phase 6 — React frontend
+  21. Upload and onboarding view
+  22. Recommendation feed
+  23. Filter and browse view
+
+Phase 7 — Documentation and polish
+  24. Write README
+  25. Add unit tests
+  26. Dockerize and deploy
