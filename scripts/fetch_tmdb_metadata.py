@@ -1,3 +1,5 @@
+# Look up TMDB id for each movie in personal ratings
+
 import os
 import time
 import requests
@@ -10,7 +12,6 @@ TMDB_API_KEY = os.getenv('TMDB_API_KEY')
 TMDB_BASE = "https://api.themoviedb.org/3"
 
 data_path = Path('data')
-
 
 def lookup_tmdb(name, year, rating, api_key):
     def search(params):

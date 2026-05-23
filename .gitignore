@@ -1,5 +1,8 @@
-data/
+data/*.csv
+data/ml-*/
+data/extra/
 __pycache__/
 .ipynb_checkpoints/
 venv/
 .env
+.claude/
