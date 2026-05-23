@@ -1,4 +1,5 @@
 data/*.csv
+data/*.npz
 data/ml-*/
 data/extra/
 __pycache__/

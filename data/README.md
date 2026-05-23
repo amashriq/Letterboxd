@@ -9,6 +9,8 @@
 - **movielens_matched.csv** — Subset of tmdb_metadata.csv for movies that exist in the MovieLens dataset, with the MovieLens `movieId` added. Produced by `scripts/match_movielens.py`.
 - **movielens_unmatched.csv** — Subset of tmdb_metadata.csv for movies with no match in MovieLens (typically recent releases). Produced by `scripts/match_movielens.py`.
 
+- **svd_item_vectors.npz** — Item embedding matrix from Funk SVD trained on MovieLens 32M. Contains `item_vectors` (n_items × k), `item_biases`, `movieids`, and `global_mean`. Produced by `scripts/train_svd.py`.
+
 ## Directories
 - **ml-32m/** — MovieLens 32M dataset. Downloaded from [grouplens.org](https://grouplens.org/datasets/movielens/).
 - **extra/** — Additional Letterboxd export files (watchlist, likes, reviews, etc.).
