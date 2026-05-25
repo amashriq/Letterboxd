@@ -2,5 +2,6 @@ pandas
 numpy
 jupyter
 requests
+httpx
 python-dotenv
 scikit-surprise
