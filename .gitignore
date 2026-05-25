@@ -1,9 +1,5 @@
-data/*.csv
-data/*.npz
-data/*.jsonl
-data/*.pkl
-data/ml-*/
-data/extra/
+data/
+!data/README.md
 __pycache__/
 .ipynb_checkpoints/
 venv/
