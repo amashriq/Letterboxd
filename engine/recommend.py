@@ -79,10 +79,12 @@ def load_movie_metadata(movies_path: "Path | str") -> dict[int, tuple[str, str]]
         Maps integer MovieLens movie IDs to ``(title, genres)`` tuples.
     """
     df = pd.read_csv(movies_path, usecols=["movieId", "title", "genres"])
-    return {
-        int(row.movieId): (row.title, row.genres)
-        for row in df.itertuples(index=False)
-    }
+    # Iterate over Series columns directly — yields Any, so int()/str() resolve
+    # cleanly without the Scalar-type complaints from itertuples().
+    meta: dict[int, tuple[str, str]] = {}
+    for mid, title, genres in zip(df["movieId"], df["title"], df["genres"]):
+        meta[int(mid)] = (str(title), str(genres))
+    return meta
 
 
 # ---------------------------------------------------------------------------
