@@ -26,6 +26,7 @@ import pickle
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import cast
 
 import httpx
 import numpy as np
@@ -285,10 +286,10 @@ def build_features(
         med = float(np.median(pos)) if len(pos) > 0 else 1.0
         return np.log1p(np.where(arr > 0, arr, med))
 
-    def year_norm(arr: np.ndarray) -> np.ndarray:
+    def year_norm(arr: np.ndarray) -> tuple[np.ndarray, float, float]:
         valid = arr[arr > 0]
-        mu  = valid.mean()  if len(valid) > 0 else 1990.0
-        std = valid.std()   if len(valid) > 0 else 20.0
+        mu  = float(valid.mean())  if len(valid) > 0 else 1990.0
+        std = float(valid.std())   if len(valid) > 0 else 20.0
         return np.where(arr > 0, (arr - mu) / (std + 1e-9), 0.0), mu, std
 
     runtime_imputed = np.where(runtimes > 0, runtimes, runtimes[runtimes > 0].mean() if (runtimes > 0).any() else 90.0)
@@ -320,11 +321,11 @@ def build_features(
     min_df   = min(5, max(1, n // 200))   # 1 for n<200, scales up to 5 at n≥1000
     tfidf    = TfidfVectorizer(min_df=min_df, max_features=2000, sublinear_tf=True)
     try:
-        kw_sp = tfidf.fit_transform(kw_docs).astype(np.float32)
+        kw_sp = sparse.csr_matrix(tfidf.fit_transform(kw_docs), dtype=np.float32)
     except ValueError:
-        # All keywords pruned (very small corpus) -- return empty keyword block
+        # All keywords pruned (very small corpus) -- fall back to min_df=1
         tfidf = TfidfVectorizer(min_df=1, max_features=2000, sublinear_tf=True)
-        kw_sp = tfidf.fit_transform(kw_docs).astype(np.float32)
+        kw_sp = sparse.csr_matrix(tfidf.fit_transform(kw_docs), dtype=np.float32)
     kw_feature_names = [f"kw:{w}" for w in tfidf.get_feature_names_out()]
 
     # ── 4. Director binary ───────────────────────────────────────────────
@@ -367,9 +368,11 @@ def build_features(
     cast_feature_names = [f"cast:{cid}" for cid in freq_cast]
 
     # ── Combine ───────────────────────────────────────────────────────────
-    feature_matrix = sparse.hstack(
+    # cast() tells Pylance the concrete type; sparse.hstack return type is a
+    # broad union that Pylance can't narrow despite format="csr".
+    feature_matrix = cast(sparse.csr_matrix, sparse.hstack(
         [genre_sp, numeric_sp, kw_sp, dir_sp, cast_sp], format="csr"
-    )
+    ))
 
     genre_feature_names = [f"genre:{name}" for name in GENRE_NAMES]
     numeric_feature_names = [
@@ -381,9 +384,11 @@ def build_features(
         + kw_feature_names + dir_feature_names + cast_feature_names
     )
 
-    print(f"  Feature matrix: {feature_matrix.shape[0]} films × {feature_matrix.shape[1]} features "
-          f"({feature_matrix.nnz / (feature_matrix.shape[0] * feature_matrix.shape[1]) * 100:.2f}% dense)")
-    print(f"    Genres: {N_GENRES}  Numerics: 7  Keywords: {kw_sp.shape[1]}  "
+    n_films, n_feats = feature_matrix.shape  # type: ignore[misc]
+    _, n_kw = kw_sp.shape                    # type: ignore[misc]
+    print(f"  Feature matrix: {n_films} films x {n_feats} features "
+          f"({feature_matrix.nnz / (n_films * n_feats) * 100:.2f}% dense)")
+    print(f"    Genres: {N_GENRES}  Numerics: 7  Keywords: {n_kw}  "
           f"Directors: {n_dirs}  Cast: {n_cast}")
 
     return {
