@@ -95,9 +95,15 @@ async def _get(
             try:
                 resp = await client.get(url, params=params)
                 resp.raise_for_status()
+                if not resp.content:
+                    print(f"  [warn] {url}: empty response body, skipping")
+                    return None
                 return resp.json()
             except httpx.HTTPError as exc:
                 print(f"  [warn] {url}: {exc}")
+                return None
+            except ValueError as exc:
+                print(f"  [warn] {url}: bad JSON ({exc}), skipping")
                 return None
 
 
@@ -126,7 +132,8 @@ async def _fetch_one(
 
     return {
         "tmdb_id":           tmdb_id,
-        "genre_ids":         [g["id"]   for g in detail.get("genres", [])],
+        "genre_ids":         [gid  for g in detail.get("genres", [])
+                              if (gid := g.get("id")) is not None],
         "runtime":           detail.get("runtime") or 0,
         "release_date":      detail.get("release_date", ""),
         "original_language": detail.get("original_language", ""),
@@ -134,15 +141,18 @@ async def _fetch_one(
         "vote_count":        detail.get("vote_count",   0),
         "budget":            detail.get("budget",  0),
         "revenue":           detail.get("revenue", 0),
-        "keyword_ids":   [k["id"]   for k in (kw_resp or {}).get("keywords", [])],
-        "keyword_names": [k["name"] for k in (kw_resp or {}).get("keywords", [])],
+        "keyword_ids":   [kid  for k in (kw_resp or {}).get("keywords", [])
+                          if (kid  := k.get("id"))   is not None],
+        "keyword_names": [name for k in (kw_resp or {}).get("keywords", [])
+                          if (name := k.get("name")) is not None],
         "director_ids":  [
-            c["id"] for c in (cr_resp or {}).get("crew", [])
-            if c.get("job") == "Director"
+            did for c in (cr_resp or {}).get("crew", [])
+            if c.get("job") == "Director" and (did := c.get("id")) is not None
         ],
         "cast": [
-            {"id": c["id"], "order": c["order"]}
+            {"id": cid, "order": order}
             for c in (cr_resp or {}).get("cast", [])[:5]  # top-5 billed
+            if (cid := c.get("id")) is not None and (order := c.get("order")) is not None
         ],
     }
 
@@ -211,7 +221,9 @@ async def fetch_all(
         if result is not None:
             fetched[tid] = result
 
-    print(f"  Fetch complete. {len(fetched)} total records.")
+    n_lost = len(tmdb_ids) - len(fetched)
+    print(f"  Fetch complete. {len(fetched)} records fetched, "
+          f"{n_lost} lost to errors ({n_lost / len(tmdb_ids) * 100:.1f}% of total).")
     return fetched
 
 
@@ -228,6 +240,8 @@ def _znorm(x: np.ndarray) -> np.ndarray:
 def build_features(
     records: dict[int, dict],
     movieid_by_tmdbid: dict[int, int],
+    min_director_films: int = 3,
+    min_cast_films: int = 5,
 ) -> dict:
     """
     Convert raw per-film dicts into a combined sparse feature matrix.
@@ -253,7 +267,7 @@ def build_features(
     # ── 1. Genre one-hot ──────────────────────────────────────────────────
     genre_rows, genre_cols, genre_data = [], [], []
     for i, rec in enumerate(recs):
-        for gid in rec["genre_ids"]:
+        for gid in rec.get("genre_ids", []):
             col = GENRE_ID_TO_IDX.get(gid)
             if col is not None:
                 genre_rows.append(i); genre_cols.append(col); genre_data.append(1.0)
@@ -317,7 +331,7 @@ def build_features(
     # Each film's keywords treated as a "document" of space-separated tokens.
     # min_df=5 for large corpora; falls back to min_df=1 for small dry runs.
     # https://scikit-learn.org/stable/modules/generated/sklearn.feature_extraction.text.TfidfVectorizer.html
-    kw_docs  = [" ".join(r["keyword_names"]) for r in recs]
+    kw_docs  = [" ".join(r.get("keyword_names", [])) for r in recs]
     min_df   = min(5, max(1, n // 200))   # 1 for n<200, scales up to 5 at n≥1000
     tfidf    = TfidfVectorizer(min_df=min_df, max_features=2000, sublinear_tf=True)
     try:
@@ -331,15 +345,15 @@ def build_features(
     # ── 4. Director binary ───────────────────────────────────────────────
     dir_counter: Counter = Counter()
     for rec in recs:
-        for did in rec["director_ids"]:
+        for did in rec.get("director_ids", []):
             dir_counter[did] += 1
-    freq_directors = [did for did, cnt in dir_counter.items() if cnt >= 3]
+    freq_directors = [did for did, cnt in dir_counter.items() if cnt >= min_director_films]
     dir_to_idx     = {did: i for i, did in enumerate(freq_directors)}
     n_dirs         = len(dir_to_idx)
 
     dr_rows, dr_cols, dr_data = [], [], []
     for i, rec in enumerate(recs):
-        for did in rec["director_ids"]:
+        for did in rec.get("director_ids", []):
             if did in dir_to_idx:
                 dr_rows.append(i); dr_cols.append(dir_to_idx[did]); dr_data.append(1.0)
     dir_sp = sparse.csr_matrix(
@@ -350,15 +364,15 @@ def build_features(
     # ── 5. Cast billing-weighted ─────────────────────────────────────────
     cast_counter: Counter = Counter()
     for rec in recs:
-        for c in rec["cast"]:
+        for c in rec.get("cast", []):
             cast_counter[c["id"]] += 1
-    freq_cast  = [cid for cid, cnt in cast_counter.items() if cnt >= 5]
+    freq_cast  = [cid for cid, cnt in cast_counter.items() if cnt >= min_cast_films]
     cast_to_idx = {cid: i for i, cid in enumerate(freq_cast)}
     n_cast      = len(cast_to_idx)
 
     ca_rows, ca_cols, ca_data = [], [], []
     for i, rec in enumerate(recs):
-        for c in rec["cast"]:
+        for c in rec.get("cast", []):
             if c["id"] in cast_to_idx:
                 weight = 1.0 / (c["order"] + 1)  # lead = 1.0, 2nd = 0.5, …
                 ca_rows.append(i); ca_cols.append(cast_to_idx[c["id"]]); ca_data.append(weight)
@@ -447,6 +461,10 @@ def main() -> None:
                         help="Process only the first N films (for dry runs).")
     parser.add_argument("--skip-build", action="store_true",
                         help="Fetch only; skip feature matrix build (resume later).")
+    parser.add_argument("--min-director-films", type=int, default=3,
+                        help="Min films a director must appear in to get a feature column (default: 3).")
+    parser.add_argument("--min-cast-films", type=int, default=5,
+                        help="Min films an actor must appear in to get a feature column (default: 5).")
     args = parser.parse_args()
 
     api_key = os.getenv("TMDB_API_KEY")
@@ -470,7 +488,9 @@ def main() -> None:
         return
 
     # Build and save
-    result = build_features(records, movieid_by_tmdbid)
+    result = build_features(records, movieid_by_tmdbid,
+                            min_director_films=args.min_director_films,
+                            min_cast_films=args.min_cast_films)
     save_features(result)
 
 
