@@ -231,10 +231,19 @@ async def fetch_all(
 # Feature engineering
 # ---------------------------------------------------------------------------
 
-def _znorm(x: np.ndarray) -> np.ndarray:
-    """Z-score normalise, safe against zero std."""
-    std = x.std()
-    return (x - x.mean()) / (std if std > 1e-9 else 1.0)
+def _znorm_fit(x: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """
+    Z-score normalise, returning (normalised, mean, std).
+
+    The mean/std must be persisted (see ``numeric_stats`` below) so that a
+    film encoded later at serve time -- one TMDB record, not a corpus -- can
+    be normalised with these SAME stats rather than degenerate single-sample
+    ones. Safe against zero std.
+    """
+    mean = float(x.mean())
+    std  = float(x.std())
+    std  = std if std > 1e-9 else 1.0
+    return (x - mean) / std, mean, std
 
 
 def build_features(
@@ -294,11 +303,13 @@ def build_features(
     m = vote_avg[rated_mask].mean() if rated_mask.any() else 6.0
     bayesian_vote = (vote_cnt * vote_avg + C * m) / (vote_cnt + C)
 
-    # Impute zeros with median before log-scaling
-    def log_impute(arr: np.ndarray) -> np.ndarray:
+    # Impute zeros with median before log-scaling. The impute VALUE is
+    # persisted too -- a new film with e.g. budget=0 must be imputed with the
+    # same median the training corpus used, not its own (undefined for n=1).
+    def log_impute(arr: np.ndarray) -> tuple[np.ndarray, float]:
         pos = arr[arr > 0]
         med = float(np.median(pos)) if len(pos) > 0 else 1.0
-        return np.log1p(np.where(arr > 0, arr, med))
+        return np.log1p(np.where(arr > 0, arr, med)), med
 
     def year_norm(arr: np.ndarray) -> tuple[np.ndarray, float, float]:
         valid = arr[arr > 0]
@@ -306,23 +317,44 @@ def build_features(
         std = float(valid.std())   if len(valid) > 0 else 20.0
         return np.where(arr > 0, (arr - mu) / (std + 1e-9), 0.0), mu, std
 
-    runtime_imputed = np.where(runtimes > 0, runtimes, runtimes[runtimes > 0].mean() if (runtimes > 0).any() else 90.0)
+    runtime_impute_value = (
+        float(runtimes[runtimes > 0].mean()) if (runtimes > 0).any() else 90.0
+    )
+    runtime_imputed = np.where(runtimes > 0, runtimes, runtime_impute_value)
     years_norm, year_mean, year_std = year_norm(years)
 
+    bayesian_vote_norm, bv_mean, bv_std   = _znorm_fit(bayesian_vote)
+    vote_count_log_norm, vcl_mean, vcl_std = _znorm_fit(np.log1p(vote_cnt))
+    runtime_norm, rt_mean, rt_std         = _znorm_fit(runtime_imputed)
+    budget_log, budget_impute_value       = log_impute(budgets)
+    budget_log_norm, bl_mean, bl_std      = _znorm_fit(budget_log)
+    revenue_log, revenue_impute_value     = log_impute(revenues)
+    revenue_log_norm, rl_mean, rl_std     = _znorm_fit(revenue_log)
+
     numeric_dense = np.column_stack([
-        _znorm(bayesian_vote),
-        _znorm(np.log1p(vote_cnt)),
-        _znorm(runtime_imputed),
-        _znorm(log_impute(budgets)),
-        _znorm(log_impute(revenues)),
+        bayesian_vote_norm,
+        vote_count_log_norm,
+        runtime_norm,
+        budget_log_norm,
+        revenue_log_norm,
         years_norm,
         is_english,
     ]).astype(np.float32)
     numeric_sp = sparse.csr_matrix(numeric_dense)
 
+    # Every stat needed to encode ONE new film identically to this corpus at
+    # serve time -- see engine/content.py's encode_movie_content().
     numeric_stats = {
         "bayesian_C": C,
         "bayesian_m": float(m),
+        "bayesian_vote_mean":   bv_mean,  "bayesian_vote_std":   bv_std,
+        "vote_count_log_mean":  vcl_mean, "vote_count_log_std":  vcl_std,
+        "runtime_impute_value": runtime_impute_value,
+        "runtime_mean":         rt_mean,  "runtime_std":         rt_std,
+        "budget_impute_value":  budget_impute_value,
+        "budget_log_mean":      bl_mean,  "budget_log_std":      bl_std,
+        "revenue_impute_value": revenue_impute_value,
+        "revenue_log_mean":     rl_mean,  "revenue_log_std":     rl_std,
         "year_mean":  float(year_mean),
         "year_std":   float(year_std),
     }
