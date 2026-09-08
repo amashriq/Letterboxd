@@ -11,12 +11,13 @@
 # since there is no row for it to look up.
 #
 # Public API:
-#   artifacts     = load_hybrid_artifacts(Path("data/lightfm_artifacts.npz"))
+#   artifacts     = load_hybrid_artifacts(Path("data/hybrid_mf_artifacts.npz"))
 #   content_store = load_content_store(
 #       Path("data/tmdb_content_features.npz"),
 #       Path("data/tmdb_content_features_sparse.npz"),
 #       Path("data/tmdb_content_tfidf.pkl"),
 #   )
+#   hit      = await search_tmdb_by_title(title, api_key, year)    # only for a movie with no MovieLens id to key off of
 #   record   = await fetch_movie_record(tmdb_id, api_key)          # only for movies not already in content_store
 #   feat_row = get_content_row(movie_id, content_store, record)    # None if genuinely unencodable
 #   item_vector, item_bias, is_cold = get_item_representation(movie_id, artifacts, feat_row)
@@ -35,6 +36,8 @@ from scipy import sparse
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from engine.match import RateLimiter
 from scripts.fetch_tmdb_content import GENRE_ID_TO_IDX, _fetch_one
+
+TMDB_BASE = "https://api.themoviedb.org/3"
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +113,43 @@ def load_content_store(
 # ---------------------------------------------------------------------------
 # Fetching + encoding a movie NOT already in the content store
 # ---------------------------------------------------------------------------
+
+async def search_tmdb_by_title(
+    title: str, api_key: str, year: Optional[int] = None
+) -> Optional[dict]:
+    """
+    Resolve a bare title to a TMDB search hit, for a movie with no
+    MovieLens id to key off of at all (nothing else in this module can
+    resolve one -- ``get_content_row``/``get_item_representation`` both
+    need a ``fresh_record``, which needs a ``tmdb_id`` first).
+
+    Mirrors the year-then-bare-fallback lookup already proven by
+    ``engine.match._search_one`` / ``scripts/archive/fetch_tmdb_metadata.py``'s
+    ``lookup_tmdb``: try a year-scoped search first when ``year`` is known,
+    fall back to a bare title search if that returns nothing (or if no year
+    was given at all).
+
+    Returns the top ``/search/movie`` hit (dict with at least ``id``,
+    ``title``, ``release_date``), or ``None`` if nothing matched either way.
+    """
+    import httpx
+
+    base_params = {"api_key": api_key, "query": title, "include_adult": False}
+
+    async def _search(params: dict) -> list:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(f"{TMDB_BASE}/search/movie", params=params)
+            resp.raise_for_status()
+            return resp.json().get("results", [])
+
+    results: list = []
+    if year is not None:
+        results = await _search({**base_params, "primary_release_year": year})
+    if not results:
+        results = await _search(base_params)
+
+    return results[0] if results else None
+
 
 async def fetch_movie_record(tmdb_id: int, api_key: str) -> Optional[dict]:
     """
