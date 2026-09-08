@@ -205,7 +205,7 @@ def _score_item_cf(
 def fold_in_user(
     matched: list[dict],
     hybrid_artifacts: dict,
-    alpha: float = 1.0,
+    alpha: float = 10.0,
 ) -> tuple[np.ndarray, float]:
     """
     Estimate a user vector for someone who was NOT part of
@@ -226,10 +226,11 @@ def fold_in_user(
     fit, not a retrain: it's what makes a new/updated ``ratings.csv`` usable
     immediately instead of requiring hours of joint training.
 
-    Note this targets real star ratings, not BPR scores -- even though the
-    item vectors were trained with a pairwise ranking loss
-    (see ``scripts/train_hybrid_mf.py``), Ridge here calibrates the user
-    vector directly against the 0.5-5 rating scale, so
+    ``scripts/train_hybrid_mf.py`` trains the item vectors via EXPLICIT-rating
+    MSE regression (not BPR/WARP pairwise ranking, despite the architecture
+    being based on LightFM -- see that script's own header comment for why),
+    so they're already on the 0.5-5 rating scale and Ridge here just
+    calibrates a matching user vector against them, and
     :func:`predict_rating` returns a genuine rating estimate.
 
     Parameters
@@ -240,9 +241,37 @@ def fold_in_user(
     hybrid_artifacts:
         Dict returned by :func:`engine.content.load_hybrid_artifacts`.
     alpha:
-        Ridge regularisation strength. Higher = user vector pulled closer to
-        zero (safer with few ratings); lower = fits the given ratings more
-        tightly (only sensible with many of them).
+        Ridge regularisation strength, passed straight to ``Ridge`` -- no
+        ``n``-dependent scaling (an ``alpha/(alpha+n)`` adaptive version was
+        tried and reverted; see git history around 2026-09-08 if reviving it).
+        Higher = user vector pulled closer to zero (safer with few ratings);
+        lower = fits the given ratings more tightly (only sensible with many
+        of them).
+
+        STATUS (as of 2026-09-08): default raised from sklearn's ``1.0`` to
+        ``10.0`` based on one concrete empirical case, not a real
+        cross-validation (planned, using a second Letterboxd profile with
+        substantially more ratings as a bigger test set). On a real
+        52-rating profile at ``alpha=1.0``, the top-5 unrated recommendations
+        were dominated by one outsized dot-product alignment (three films
+        sharing a director/cast, scoring 2-4x higher than a film the user
+        had actually rated 5.0 themselves); a sweep from 1 to 100 showed that
+        effect shrinking steadily as alpha rose, crossing over to titles
+        matching the user's actual highest-rated genres/franchises by
+        alpha=20-50. ``10.0`` sits before that full crossover (partial
+        improvement, not a fix) -- it's a reasonable starting point to test
+        with, not a value confirmed to resolve the issue.
+
+        NEXT STEPS (planned, not started): a naive ``alpha/(alpha+n)`` scaling
+        rule was tried here and reverted -- it made things worse, not better
+        (see git history), because it was guessed rather than fit to data.
+        The real plan: using the second, larger Letterboxd profile, sweep
+        alpha at several different matched-rating counts n (e.g. subsample
+        that profile down to n=20/50/100/200/... and re-fit at each size),
+        record whichever alpha performs best (by held-out RMSE, not by eye)
+        at each n, and see whether those (n, best_alpha) pairs actually trace
+        out a describable relationship -- only then would an n-dependent
+        formula be justified, rather than assumed up front.
 
     Returns
     -------

@@ -213,7 +213,11 @@ def main():
         for mid, rating in zip(matched_df["movieId"], matched_df["rating"])
     }
     matched = [{"movieId": mid, "rating": rating} for mid, rating in already_rated.items()]
-    user_vector, user_bias = fold_in_user(matched, artifacts, alpha=1.0)
+    # alpha=10.0 is a fixed Ridge regularization strength (raised from sklearn's
+    # 1.0 default), not cross-validated yet -- see fold_in_user's docstring
+    # (engine/recommend.py) for the full rationale and a known prior failure
+    # mode this only partially addresses.
+    user_vector, user_bias = fold_in_user(matched, artifacts, alpha=10.0)
 
     # --- Score: warm (trained item vector) vs. cold (live fetch either way) ---
     correction = 0.0
