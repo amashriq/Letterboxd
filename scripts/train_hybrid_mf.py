@@ -13,8 +13,8 @@
 # negative sampling needed, unlike a BPR/WARP setup.
 #
 # Produces:
-#   data/lightfm_artifacts.npz  -- item/feature embeddings + movie_ids + feature_names
-#   data/lightfm_model.pth      -- full model state dict for fine-tuning or inspection
+#   data/hybrid_mf_artifacts.npz  -- item/feature embeddings + movie_ids + feature_names
+#   data/hybrid_mf_model.pth      -- full model state dict for fine-tuning or inspection
 #
 # Usage:
 #   python scripts/train_hybrid_mf.py                # full run (30 epochs)
@@ -41,8 +41,8 @@ import torch.nn.functional as F
 sys.stdout.reconfigure(line_buffering=True)
 
 DATA_DIR = Path(__file__).parent.parent / "data"
-CHECKPOINT_PATH = DATA_DIR / "lightfm_checkpoint.pth"
-PROGRESS_PATH   = DATA_DIR / "lightfm_training_progress.json"
+CHECKPOINT_PATH = DATA_DIR / "hybrid_mf_checkpoint.pth"
+PROGRESS_PATH   = DATA_DIR / "hybrid_mf_training_progress.json"
 
 MIN_RATINGS = 20
 
@@ -269,7 +269,7 @@ def compute_rmse(
 
 # ---------------------------------------------------------------------------
 # Checkpointing -- resumable training state, separate from the final
-# lightfm_artifacts.npz/lightfm_model.pth serving format. A long unattended
+# hybrid_mf_artifacts.npz/hybrid_mf_model.pth serving format. A long unattended
 # run has real ways to die mid-training (forced OS update/restart, dead
 # battery during sleep, a closed terminal) with nothing recoverable unless
 # progress is saved incrementally, not just once at the very end.
@@ -416,8 +416,8 @@ def train(args: argparse.Namespace) -> None:
     # RMSE is the second-most expensive step -- no need to pay for it every epoch.
     eval_every = 1 if args.dry_run else args.eval_every
 
-    out_npz = DATA_DIR / "lightfm_artifacts.npz"
-    out_pth = DATA_DIR / "lightfm_model.pth"
+    out_npz = DATA_DIR / "hybrid_mf_artifacts.npz"
+    out_pth = DATA_DIR / "hybrid_mf_model.pth"
 
     for epoch in range(start_epoch, n_epochs + 1):
         rng.shuffle(perm)  # in place -- no new allocation
