@@ -199,13 +199,112 @@ def _score_item_cf(
 
 
 # ---------------------------------------------------------------------------
-# Public orchestrator
+# Fold-in: estimate a user vector for the hybrid MF model (engine.content)
 # ---------------------------------------------------------------------------
 
-# TODO(slice-2): add _score_foldin(artifacts, matched, exclude_ids) using
-# RidgeCV to estimate a user vector and compute μ + b_u + b_i + u·qᵢ.
-# Blend tiers: 50–150 → item_cf dominant + foldin secondary;
-#              150+   → foldin dominant + item_cf secondary.
+def fold_in_user(
+    matched: list[dict],
+    hybrid_artifacts: dict,
+    alpha: float = 1.0,
+) -> tuple[np.ndarray, float]:
+    """
+    Estimate a user vector for someone who was NOT part of
+    ``scripts/train_hybrid_mf.py``'s training run -- i.e. everyone, since
+    that script deliberately never bakes any specific user's ratings in.
+
+    Fits a `Ridge regression <https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.Ridge.html>`_
+    with the user's own known ratings as targets and the corresponding
+    FROZEN, already-trained item vectors as features:
+
+    .. math::
+
+        \\text{rating}_i \\approx \\mu + b_i + b_u + \\mathbf{u} \\cdot \\mathbf{q}_i
+
+    Only :math:`\\mathbf{u}` (``user_vector``) and :math:`b_u`
+    (``user_bias``, Ridge's intercept) are unknowns -- everything else comes
+    straight from ``hybrid_artifacts``. This is a few-millisecond closed-form
+    fit, not a retrain: it's what makes a new/updated ``ratings.csv`` usable
+    immediately instead of requiring hours of joint training.
+
+    Note this targets real star ratings, not BPR scores -- even though the
+    item vectors were trained with a pairwise ranking loss
+    (see ``scripts/train_hybrid_mf.py``), Ridge here calibrates the user
+    vector directly against the 0.5-5 rating scale, so
+    :func:`predict_rating` returns a genuine rating estimate.
+
+    Parameters
+    ----------
+    matched:
+        Output of ``engine.match.match_ratings`` -- each dict must contain
+        ``"movieId"`` (int) and ``"rating"`` (float).
+    hybrid_artifacts:
+        Dict returned by :func:`engine.content.load_hybrid_artifacts`.
+    alpha:
+        Ridge regularisation strength. Higher = user vector pulled closer to
+        zero (safer with few ratings); lower = fits the given ratings more
+        tightly (only sensible with many of them).
+
+    Returns
+    -------
+    user_vector : np.ndarray, shape (k,)
+    user_bias : float
+
+    Raises
+    ------
+    ValueError
+        If fewer than 2 of the matched ratings are on movies the model was
+        actually trained on -- Ridge needs at least that many points to fit
+        a k-dimensional vector plus an intercept meaningfully.
+    """
+    from sklearn.linear_model import Ridge
+
+    global_mean = hybrid_artifacts["global_mean"]
+    movieid_to_idx = hybrid_artifacts["movieid_to_idx"]
+    item_embeddings = hybrid_artifacts["item_embeddings"]
+    item_biases = hybrid_artifacts["item_biases"]
+
+    X: list[np.ndarray] = []
+    y: list[float] = []
+    for m in matched:
+        idx = movieid_to_idx.get(int(m["movieId"]))
+        if idx is None:
+            continue  # movie has no trained item vector -- can't use it to fold in
+        X.append(item_embeddings[idx])
+        y.append(float(m["rating"]) - global_mean - float(item_biases[idx]))
+
+    if len(X) < 2:
+        raise ValueError(
+            f"Only {len(X)} matched rating(s) are on movies the model was "
+            "trained on -- need at least 2 to fold in a user vector."
+        )
+
+    ridge = Ridge(alpha=alpha, fit_intercept=True)
+    ridge.fit(np.array(X), np.array(y))
+    return ridge.coef_, float(ridge.intercept_)
+
+
+def predict_rating(
+    user_vector: np.ndarray,
+    user_bias: float,
+    item_vector: np.ndarray,
+    item_bias: float,
+    global_mean: float,
+) -> float:
+    """
+    Predicted rating for one (user, item) pair, on the same scale as the
+    training ratings (MovieLens: 0.5-5.0 in 0.5 steps -- clamp/round at the
+    call site if you need a display value on that exact scale).
+
+    ``item_vector``/``item_bias`` should come from
+    :func:`engine.content.get_item_representation`, which already handles
+    the warm/cold split.
+    """
+    return global_mean + user_bias + item_bias + float(np.dot(user_vector, item_vector))
+
+
+# ---------------------------------------------------------------------------
+# Public orchestrator
+# ---------------------------------------------------------------------------
 
 def recommend(
     matched: list[dict],

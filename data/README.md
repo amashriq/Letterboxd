@@ -17,6 +17,11 @@
 - **tmdb_content_tfidf.pkl** — Fitted TfidfVectorizer for keyword encoding at serve time. Produced by `scripts/fetch_tmdb_content.py`.
 - **tmdb_content_raw.jsonl** — Checkpoint file from TMDB batch fetch (one JSON record per film, used for resumable runs). Produced by `scripts/fetch_tmdb_content.py`.
 
+- **lightfm_artifacts.npz** — Trained hybrid MF embeddings, refreshed after every epoch (not just at the end). Keys: `item_embeddings` (n_items × k), `item_biases` (n_items,), `content_feature_embeddings` (k × n_features), `content_feature_biases` (n_features,), `movie_ids` (n_items,), `feature_names` (n_features,), `global_mean` (scalar — model predicts rating deviation from this; add it back at serve time). Produced by `scripts/train_hybrid_mf.py`.
+- **lightfm_model.pth** — Full PyTorch model state dict for fine-tuning or inspection, refreshed every epoch. Produced by `scripts/train_hybrid_mf.py`.
+- **lightfm_checkpoint.pth** — Resumable training state (model + both optimizers' state dicts + epoch number), overwritten every epoch so an interrupted run can continue with `python scripts/train_hybrid_mf.py` (same args) instead of restarting; pass `--fresh` to ignore it. Not needed for serving. Produced by `scripts/train_hybrid_mf.py`.
+- **lightfm_training_progress.json** — `{epoch, of, mse_loss, rmse, updated_at, done}`, overwritten every epoch — cheap way to check training progress without loading the checkpoint. Produced by `scripts/train_hybrid_mf.py`.
+
 ## Directories
 - **ml-32m/** — MovieLens 32M dataset. Downloaded from [grouplens.org](https://grouplens.org/datasets/movielens/).
 - **extra/** — Additional Letterboxd export files (watchlist, likes, reviews, etc.).
