@@ -1,12 +1,12 @@
 pandas
 numpy
-jupyter
+jupyter           # notebooks/demo.ipynb, notebooks/archive/*.ipynb
+matplotlib        # only for notebooks/demo.ipynb's recommendation bar chart
 requests
 httpx
 python-dotenv
-scikit-surprise
+scikit-surprise   # only for scripts/archive/train_svd.py (archived Funk SVD pipeline)
 scikit-learn
 scipy
 torch
-# lightfm — install via conda: conda install -c conda-forge lightfm
-# (no Python 3.12 wheel on PyPI; required only for scripts/train_lightfm.py)
+pytest            # tests/

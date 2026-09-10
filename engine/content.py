@@ -123,16 +123,21 @@ async def search_tmdb_by_title(
     resolve one -- ``get_content_row``/``get_item_representation`` both
     need a ``fresh_record``, which needs a ``tmdb_id`` first).
 
-    Mirrors the year-then-bare-fallback lookup already proven by
-    ``engine.match._search_one`` / ``scripts/archive/fetch_tmdb_metadata.py``'s
-    ``lookup_tmdb``: try a year-scoped search first when ``year`` is known,
-    fall back to a bare title search if that returns nothing (or if no year
-    was given at all).
+    Queries both a year-scoped and a bare title search (not short-circuited
+    on the first non-empty one) and picks the best result by year proximity
+    via ``engine.match.pick_best_tmdb_match`` -- TMDB's own
+    ``primary_release_year`` filter doesn't reliably exclude other years for
+    real title collisions (e.g. Mean Girls 2004 vs. 2024), so trusting
+    either query's top hit blindly risks resolving to the wrong film
+    entirely, same fix as ``scripts/fetch_tmdb_metadata.py``'s ``lookup_tmdb``.
 
-    Returns the top ``/search/movie`` hit (dict with at least ``id``,
-    ``title``, ``release_date``), or ``None`` if nothing matched either way.
+    Returns the best ``/search/movie`` hit (dict with at least ``id``,
+    ``title``, ``release_date``), or ``None`` if nothing within a plausible
+    year matched.
     """
     import httpx
+
+    from engine.match import pick_best_tmdb_match
 
     base_params = {"api_key": api_key, "query": title, "include_adult": False}
 
@@ -142,13 +147,14 @@ async def search_tmdb_by_title(
             resp.raise_for_status()
             return resp.json().get("results", [])
 
-    results: list = []
-    if year is not None:
-        results = await _search({**base_params, "primary_release_year": year})
-    if not results:
-        results = await _search(base_params)
+    scoped = await _search({**base_params, "primary_release_year": year}) if year is not None else []
+    bare = await _search(base_params)
 
-    return results[0] if results else None
+    seen: dict[int, dict] = {}
+    for c in scoped + bare:
+        seen.setdefault(c["id"], c)
+
+    return pick_best_tmdb_match(list(seen.values()), year)
 
 
 async def fetch_movie_record(tmdb_id: int, api_key: str) -> Optional[dict]:
