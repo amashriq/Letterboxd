@@ -1,18 +1,23 @@
-# Recommendation engine for the Letterboxd recommender web app.
+# Recommendation-scoring utilities, spanning two generations of this project:
 #
-# Loads pre-trained Funk SVD item vectors and scores candidate films for a
-# given user based on their Letterboxd-matched ratings.  Supports two tiers
-# in this slice (Slice 1):
+# CURRENT (used by scripts/predict.py, scripts/recommend.py, scripts/cv_alpha.py,
+# scripts/cv_cascade.py): fold_in_user() + predict_rating() score against the
+# PyTorch hybrid MF model (scripts/train_hybrid_mf.py) via a Ridge fold-in --
+# see fold_in_user's own docstring for the full rationale.
 #
-#   0–9 matched ratings  →  popularity scoring  (global_mean + item_bias)
-#   10+ matched ratings  →  item-based CF       (weighted cosine similarity)
+# LEGACY (SVD-era, not called anywhere in the current pipeline): load_svd_artifacts(),
+# _score_popularity(), _score_item_cf(), and recommend() implement a two-tier
+# popularity/item-CF scorer against Funk SVD item vectors
+# (scripts/archive/train_svd.py, now archived). Kept live intentionally
+# (not archived) as a reference implementation of the earlier approach.
 #
-# Fold-in / blend tiers (50–150, 150+) are implemented in Slice 2.
+# load_movie_metadata() is current -- used by every script above to resolve a
+# movieId to (title, genres).
 #
 # Public API:
-#   arts = load_svd_artifacts(Path("data/svd_item_vectors.npz"))
 #   meta = load_movie_metadata(Path("data/ml-32m/movies.csv"))
-#   recs = recommend(matched, arts, meta, top_n=25, genre_filter="Drama")
+#   user_vector, user_bias = fold_in_user(matched, hybrid_artifacts)
+#   rating = predict_rating(user_vector, user_bias, item_vector, item_bias, global_mean)
 
 from pathlib import Path
 from typing import Optional
@@ -36,8 +41,9 @@ def load_svd_artifacts(npz_path: "Path | str") -> dict:
     Parameters
     ----------
     npz_path:
-        Path to ``svd_item_vectors.npz`` produced by ``scripts/train_svd.py``.
-        Expected keys: ``item_vectors`` (N×k), ``item_biases`` (N,),
+        Path to ``svd_item_vectors.npz`` produced by
+        ``scripts/archive/train_svd.py`` (archived -- see this module's
+        header comment). Expected keys: ``item_vectors`` (N×k), ``item_biases`` (N,),
         ``movieids`` (N,), ``global_mean`` (scalar wrapped in a 0-d array).
 
     Returns
@@ -205,7 +211,7 @@ def _score_item_cf(
 def fold_in_user(
     matched: list[dict],
     hybrid_artifacts: dict,
-    alpha: float = 10.0,
+    alpha: float = 100.0,
 ) -> tuple[np.ndarray, float]:
     """
     Estimate a user vector for someone who was NOT part of
@@ -248,30 +254,39 @@ def fold_in_user(
         lower = fits the given ratings more tightly (only sensible with many
         of them).
 
-        STATUS (as of 2026-09-08): default raised from sklearn's ``1.0`` to
-        ``10.0`` based on one concrete empirical case, not a real
-        cross-validation (planned, using a second Letterboxd profile with
-        substantially more ratings as a bigger test set). On a real
-        52-rating profile at ``alpha=1.0``, the top-5 unrated recommendations
-        were dominated by one outsized dot-product alignment (three films
-        sharing a director/cast, scoring 2-4x higher than a film the user
-        had actually rated 5.0 themselves); a sweep from 1 to 100 showed that
-        effect shrinking steadily as alpha rose, crossing over to titles
-        matching the user's actual highest-rated genres/franchises by
-        alpha=20-50. ``10.0`` sits before that full crossover (partial
-        improvement, not a fix) -- it's a reasonable starting point to test
-        with, not a value confirmed to resolve the issue.
+        STATUS (as of 2026-09-09): default raised to ``100.0``, backed by a
+        real leave-one-out cross-validation (``scripts/cv_alpha.py`` /
+        ``scripts/cv_cascade.py``), not the one-off empirical case this
+        docstring used to cite. Full sweep: latent-factor count k (10-256,
+        each a separately fully-retrained model) x alpha (0.3-5000) x
+        profile size n (20-286, subsampled with repeated draws from a
+        286-rating profile to avoid confounding n with which person's
+        ratings are harder to predict -- see the alpha-tuning memory).
 
-        NEXT STEPS (planned, not started): a naive ``alpha/(alpha+n)`` scaling
-        rule was tried here and reverted -- it made things worse, not better
-        (see git history), because it was guessed rather than fit to data.
-        The real plan: using the second, larger Letterboxd profile, sweep
-        alpha at several different matched-rating counts n (e.g. subsample
-        that profile down to n=20/50/100/200/... and re-fit at each size),
-        record whichever alpha performs best (by held-out RMSE, not by eye)
-        at each n, and see whether those (n, best_alpha) pairs actually trace
-        out a describable relationship -- only then would an n-dependent
-        formula be justified, rather than assumed up front.
+        Two findings from that sweep: (1) k barely affects warm-item fold-in
+        RMSE at all (~1-3% spread across the whole 10-256 range once each k
+        gets its own best alpha) -- alpha is the dominant lever, not model
+        size, so there's no k-dependent (or by extension k-per-n) formula to
+        chase here. (2) After bracketing alpha until RMSE actually turned
+        back up (not just stopping at an arbitrary upper bound -- the
+        original ``10.0`` and even a first re-check up to 100 both undershot
+        the real minimum), the true optimum for k=24 lands consistently in
+        ~60-150 across 8 of 9 tested n, with ``100.0`` hitting or sitting
+        inside that band at every one of them. One n=35 draw never turned up
+        at all even out to alpha=5000 -- not a bug, just Ridge asymptoting
+        toward a bias-only (zero-personalization) fit when a particular
+        subsample has little exploitable signal; RMSE can't rise past that
+        limit, only flatten.
+
+        NEXT STEPS (planned, not started): an ``alpha/(alpha+n)`` adaptive
+        scaling rule was tried once and reverted for being guessed rather
+        than fit (see git history around 2026-09-08) -- the cascade sweep
+        above is the fit-to-data version of that question, and its answer is
+        "no strong n-dependence was found" rather than a formula. Remaining
+        open threads: weight-decay (content-branch regularisation) was
+        deliberately excluded from the sweep since it's invisible to
+        warm-item RMSE -- testing it needs a genuinely different, cold-item
+        evaluation; and n far outside the tested 20-286 range is unverified.
 
     Returns
     -------

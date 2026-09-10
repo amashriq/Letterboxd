@@ -1,5 +1,7 @@
 # Batch-fetches TMDB metadata for every MovieLens film and builds a content
-# feature matrix for use in LightFM hybrid model training.
+# feature matrix for use in scripts/train_hybrid_mf.py's hybrid MF training
+# (the model's architecture is based on LightFM, but training itself is a
+# from-scratch PyTorch implementation -- the lightfm package isn't used).
 #
 # Calls 3 TMDB endpoints per film:
 #   GET /movie/{id}          -- genres, runtime, year, language, ratings, budget, revenue
@@ -38,11 +40,11 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 # Allow importing engine from project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from engine.match import RateLimiter
+from engine.paths import DATA_DIR
 
 load_dotenv()
 
 TMDB_BASE = "https://api.themoviedb.org/3"
-DATA_DIR   = Path(__file__).parent.parent / "data"
 CHECKPOINT = DATA_DIR / "tmdb_content_raw.jsonl"
 OUT_NPZ    = DATA_DIR / "tmdb_content_features.npz"
 OUT_TFIDF  = DATA_DIR / "tmdb_content_tfidf.pkl"

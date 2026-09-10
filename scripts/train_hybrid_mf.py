@@ -15,11 +15,14 @@
 # Produces:
 #   data/hybrid_mf_artifacts.npz  -- item/feature embeddings + movie_ids + feature_names
 #   data/hybrid_mf_model.pth      -- full model state dict for fine-tuning or inspection
+#   (pass --tag NAME to namespace these + the checkpoint/progress file as
+#   hybrid_mf_*_NAME.{npz,pth,json} instead -- e.g. for a components/hparam sweep)
 #
 # Usage:
 #   python scripts/train_hybrid_mf.py                # full run (30 epochs)
 #   python scripts/train_hybrid_mf.py --dry-run      # 5 epochs, 1k users (~1 min)
 #   python scripts/train_hybrid_mf.py --epochs 50 --components 128
+#   python scripts/train_hybrid_mf.py --components 16 --tag k16 --fresh
 
 import argparse
 import json
@@ -34,17 +37,34 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Allow importing engine from project root
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from engine.paths import DATA_DIR
+
 # Force line-buffered stdout. Python fully buffers stdout by default when it
 # isn't attached to a terminal (e.g. redirected to a log file, or run as a
 # background job) -- without this, NOTHING prints until the process exits,
 # making an 11-hour run impossible to monitor while it's running.
 sys.stdout.reconfigure(line_buffering=True)
 
-DATA_DIR = Path(__file__).parent.parent / "data"
-CHECKPOINT_PATH = DATA_DIR / "hybrid_mf_checkpoint.pth"
-PROGRESS_PATH   = DATA_DIR / "hybrid_mf_training_progress.json"
-
 MIN_RATINGS = 20
+
+
+def output_paths(tag: "str | None") -> dict[str, Path]:
+    """
+    Namespace every output file by --tag so parallel/sequential runs at
+    different --components (e.g. a latent-factor sweep) don't clobber each
+    other's checkpoint/artifacts -- and don't clobber the default (untagged)
+    model everything else in this repo reads by default. `tag=None` (or
+    unpassed) reproduces the original, untagged filenames exactly.
+    """
+    suffix = f"_{tag}" if tag else ""
+    return {
+        "checkpoint": DATA_DIR / f"hybrid_mf_checkpoint{suffix}.pth",
+        "progress":   DATA_DIR / f"hybrid_mf_training_progress{suffix}.json",
+        "artifacts":  DATA_DIR / f"hybrid_mf_artifacts{suffix}.npz",
+        "model":      DATA_DIR / f"hybrid_mf_model{suffix}.pth",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +346,10 @@ def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
+    paths = output_paths(args.tag)
+    checkpoint_path, progress_path = paths["checkpoint"], paths["progress"]
+    out_npz, out_pth = paths["artifacts"], paths["model"]
+
     user_idxs, item_idxs, rating_vals, sorted_movie_ids, movie_id_to_idx, n_users, global_mean = load_data(
         dry_run=args.dry_run
     )
@@ -382,9 +406,9 @@ def train(args: argparse.Namespace) -> None:
     # saved tensors are the wrong shape to load into this run's model --
     # fail loudly rather than silently training the wrong thing.
     start_epoch = 1
-    if CHECKPOINT_PATH.exists() and not args.fresh:
-        print(f"Found checkpoint at {CHECKPOINT_PATH.name}, resuming...")
-        ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=True)
+    if checkpoint_path.exists() and not args.fresh:
+        print(f"Found checkpoint at {checkpoint_path.name}, resuming...")
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
         if ckpt["components"] != args.components or ckpt["dry_run"] != args.dry_run:
             raise ValueError(
                 f"Checkpoint was --components={ckpt['components']} dry_run={ckpt['dry_run']}, "
@@ -415,9 +439,6 @@ def train(args: argparse.Namespace) -> None:
 
     # RMSE is the second-most expensive step -- no need to pay for it every epoch.
     eval_every = 1 if args.dry_run else args.eval_every
-
-    out_npz = DATA_DIR / "hybrid_mf_artifacts.npz"
-    out_pth = DATA_DIR / "hybrid_mf_model.pth"
 
     for epoch in range(start_epoch, n_epochs + 1):
         rng.shuffle(perm)  # in place -- no new allocation
@@ -464,11 +485,11 @@ def train(args: argparse.Namespace) -> None:
         # the end -- see save_checkpoint()'s docstring for why. Cheap: a
         # ~15-20 min epoch can easily afford a few seconds of disk I/O.
         save_checkpoint(
-            CHECKPOINT_PATH, epoch, model, sparse_optimizer, dense_optimizer,
+            checkpoint_path, epoch, model, sparse_optimizer, dense_optimizer,
             args.components, args.dry_run,
         )
         save_artifacts(out_npz, out_pth, model, sorted_movie_ids, feature_names, global_mean)
-        PROGRESS_PATH.write_text(json.dumps({
+        progress_path.write_text(json.dumps({
             "epoch": epoch, "of": n_epochs,
             "mse_loss": avg_loss, "rmse": rmse,
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -502,6 +523,11 @@ def main() -> None:
                              "(feature_embeddings/feature_biases). Default: 1e-5.")
     parser.add_argument("--eval-every",  type=int,   default=5,
                         help="Compute RMSE every N epochs (always at the last). Default: 5.")
+    parser.add_argument("--tag",         type=str,   default=None,
+                        help="Namespace all output files as hybrid_mf_*_<tag>.{npz,pth,json} "
+                             "instead of the default untagged names -- use for a latent-factor/"
+                             "hyperparameter sweep so runs don't clobber each other or the "
+                             "default model. Also namespaces checkpoint resume.")
     args = parser.parse_args()
     train(args)
 

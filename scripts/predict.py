@@ -1,20 +1,20 @@
 # CLI to predict a star rating for one movie, for the profile folded in from
-# data/movielens_matched.csv. Looks a title up in MovieLens (title search
-# REQUIRES --year -- see find_movie), scores it with the trained hybrid MF
-# model. Two cases, from best to weakest signal:
+# a --user's movielens_matched.csv (data/<user>-<date>/movielens_matched.csv).
+# Looks a title up in MovieLens (title search REQUIRES --year -- see
+# find_movie), scores it with the trained hybrid MF model. Two cases, from
+# best to weakest signal:
 #   warm -- has a trained item vector (>=MIN_RATINGS ratings): identity +
 #           content embedding
 #   cold -- everything else, treated identically regardless of whether the
 #           movie has a MovieLens id at all: live TMDB fetch (via its
 #           links.csv tmdbId if it has a MovieLens id, via a live title
-#           search if it doesn't) + content embedding + a TMDB-average bias
-#           correction (see TMDB_AVG_CORRECTION_WEIGHT below)
+#           search if it doesn't) + content embedding
 # Prints the clamped (0.5-5.0) prediction for whichever case applies.
 #
 # Usage:
-#   python scripts/predict.py --title "Mad Max: Fury Road" --year 2015
-#   python scripts/predict.py --movie-id 122904
-#   python scripts/predict.py --title "Project Hail Mary" --year 2026
+#   python scripts/predict.py --user adeeb --title "Mad Max: Fury Road" --year 2015
+#   python scripts/predict.py --user adeeb --movie-id 122904
+#   python scripts/predict.py --user caroline --title "Project Hail Mary" --year 2026
 
 import argparse
 import asyncio
@@ -37,6 +37,7 @@ from engine.content import (
     fetch_movie_record,
 )
 from engine.match import load_tmdb_to_ml
+from engine.paths import DATA_DIR, resolve_user_dir
 from engine.recommend import fold_in_user, predict_rating, load_movie_metadata
 from scripts.fetch_tmdb_content import GENRE_ID_TO_IDX, GENRE_NAMES
 
@@ -46,24 +47,6 @@ from scripts.fetch_tmdb_content import GENRE_ID_TO_IDX, GENRE_NAMES
 # right year in both that case and titles with an earlier non-year
 # parenthetical, e.g. "...(Remaining Sense of Pain) (2008)".
 YEAR_RE = re.compile(r"\((\d{4})\)\s*$")
-
-DATA_DIR = Path(__file__).parent.parent / "data"
-
-# For any cold prediction (whether or not the movie has a MovieLens id): a
-# cold item's bias term (feat_row @ feature_biases) is a shared linear
-# coefficient learned across the whole corpus, so it structurally can't
-# reproduce the range a warm item's freely-fit item_bias can -- broadly-loved
-# films get muted cold predictions as a result. This can correct for it using
-# TMDB's own average rating (fetch_movie_record already returns it, so this
-# never costs an extra API call) as a direct bias nudge, on top of (not
-# replacing) the personalized dot-product term. Weight fit via grid search
-# against 61 held-out true-cold predictions with known actual ratings (RMSE
-# 1.299 at weight=0.0 -> 1.221 at weight=0.9); see scratchpad/eval_unmatched.py
-# from that session for the search. Currently set back to 0.0 (disabled) --
-# helped on average but was noted to actively hurt genuine taste outliers
-# (a personally-disliked film that's broadly well-reviewed gets pushed
-# further from the true rating, not closer).
-TMDB_AVG_CORRECTION_WEIGHT = 0.0
 
 
 def find_movie(
@@ -162,15 +145,23 @@ def main():
         "matches and any TMDB search fallback); unused with --movie-id",
     )
     parser.add_argument(
-        "--matched-csv",
-        default=DATA_DIR / "movielens_matched.csv",
-        help="CSV of the user's ratings to fold in (default: data/movielens_matched.csv)",
+        "--user",
+        required=True,
+        help="Short user name (e.g. 'adeeb') or exact data/ folder name -- whose "
+        "ratings to fold in (see engine/paths.resolve_user_dir)",
+    )
+    parser.add_argument(
+        "--model-tag",
+        default=None,
+        help="Use hybrid_mf_artifacts_<tag>.npz (e.g. from a --tag sweep run) instead of the default model",
     )
     args = parser.parse_args()
     if args.title is not None and args.year is None:
         parser.error("--year is required when using --title")
+    user_dir = resolve_user_dir(args.user)
 
-    artifacts = load_hybrid_artifacts(DATA_DIR / "hybrid_mf_artifacts.npz")
+    artifacts_name = f"hybrid_mf_artifacts_{args.model_tag}.npz" if args.model_tag else "hybrid_mf_artifacts.npz"
+    artifacts = load_hybrid_artifacts(DATA_DIR / artifacts_name)
     meta = load_movie_metadata(DATA_DIR / "ml-32m" / "movies.csv")
     # movieId -> tmdbId, for fetching a cold-but-in-MovieLens movie's content
     # live without a fuzzy title search (we already know exactly which film
@@ -207,20 +198,18 @@ def main():
     # --- Fold in the user's ratings ---
     # Iterate over Series columns directly (not itertuples()) -- yields Any,
     # so int()/str() resolve cleanly without Scalar-type complaints.
-    matched_df = pd.read_csv(args.matched_csv)
+    matched_df = pd.read_csv(user_dir / "movielens_matched.csv")
     already_rated = {
         int(mid): float(rating)
         for mid, rating in zip(matched_df["movieId"], matched_df["rating"])
     }
     matched = [{"movieId": mid, "rating": rating} for mid, rating in already_rated.items()]
-    # alpha=10.0 is a fixed Ridge regularization strength (raised from sklearn's
-    # 1.0 default), not cross-validated yet -- see fold_in_user's docstring
-    # (engine/recommend.py) for the full rationale and a known prior failure
-    # mode this only partially addresses.
-    user_vector, user_bias = fold_in_user(matched, artifacts, alpha=10.0)
+    # Uses fold_in_user's own default alpha (100.0, as of 2026-09-09) --
+    # backed by a real leave-one-out CV sweep, not a one-off case; see
+    # fold_in_user's docstring (engine/recommend.py) for the full rationale.
+    user_vector, user_bias = fold_in_user(matched, artifacts)
 
     # --- Score: warm (trained item vector) vs. cold (live fetch either way) ---
-    correction = 0.0
     idx = artifacts["movieid_to_idx"].get(movie_id)
     if idx is not None:
         item_vector = artifacts["item_embeddings"][idx]
@@ -245,9 +234,9 @@ def main():
             if fresh_record is None:
                 print(f"{title!r} (movieId {movie_id}, tmdb_id {tmdb_id}) -- live TMDB fetch failed.")
                 sys.exit(1)
-            status_label = "cold (MovieLens entry, <20 ratings -- live TMDB fetch, TMDB-avg corrected)"
+            status_label = "cold (MovieLens entry, <20 ratings -- live TMDB fetch)"
         else:
-            status_label = "cold (no MovieLens entry -- live TMDB fetch, TMDB-avg corrected)"
+            status_label = "cold (no MovieLens entry -- live TMDB fetch)"
 
         content_store = load_content_store(
             DATA_DIR / "tmdb_content_features.npz",
@@ -256,10 +245,8 @@ def main():
         )
         feat_row = get_content_row(-1, content_store, fresh_record)
         item_vector, item_bias, _ = get_item_representation(-1, artifacts, feat_row)
-        tmdb_vote = float(fresh_record.get("vote_average") or 0.0)  # TMDB 0-10 scale
-        correction = TMDB_AVG_CORRECTION_WEIGHT * (tmdb_vote / 2 - artifacts["global_mean"])
 
-    raw_pred = predict_rating(user_vector, user_bias, item_vector, item_bias, artifacts["global_mean"]) + correction
+    raw_pred = predict_rating(user_vector, user_bias, item_vector, item_bias, artifacts["global_mean"])
     clamped = max(0.5, min(5.0, raw_pred))
     print_prediction(title, genres, movie_id, status_label, raw_pred, clamped, already_rated)
 
